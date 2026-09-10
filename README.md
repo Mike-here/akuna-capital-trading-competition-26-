@@ -16,3 +16,13 @@ python3 -m unittest -v
 The tests include all six published theoretical test cases (the exact values
 shown in the grader conversation) plus the zero-value, inventory-limit, FOK,
 and quote-validity regressions derived from the visible live-session failures.
+
+Run the deterministic local policy comparison:
+
+```sh
+python3 backtest.py
+```
+
+This reports a local relative comparison of the original and optimized policies.
+It cannot reproduce HackerRank's exact cumulative P&L because the shared chat
+contains test outcomes but not its private sequence of RFQs, FOKs, and paths.

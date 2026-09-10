@@ -116,17 +116,39 @@ class MarketParameters:
     rate_target: float = 2.0
 
 
+@dataclass(frozen=True)
+class QuotingPolicy:
+    """Tunable risk/reward controls; prices remain entirely model-driven."""
+
+    max_position: int = 12
+    max_quote_size: int = 5
+    # Competitive for high-confidence options while widening near p=0.5.
+    minimum_half_spread: float = 0.012
+    uncertainty_spread: float = 0.035
+    inventory_skew: float = 0.012
+    inventory_widening: float = 0.002
+    capital_utilization: float = 0.80
+    add_risk_edge: float = 0.025
+    reduce_risk_edge: float = 0.008
+
+
+BASELINE_POLICY: Final = QuotingPolicy(
+    max_position=30, max_quote_size=10, minimum_half_spread=0.02,
+    uncertainty_spread=0.0, inventory_skew=0.005, inventory_widening=0.0,
+    capital_utilization=1.0, add_risk_edge=0.01, reduce_risk_edge=0.01,
+)
+OPTIMIZED_POLICY: Final = QuotingPolicy()
+
+
 class MarketMaker:
     """Deterministic pricer with inventory-aware two-sided quotes."""
 
-    MAX_POSITION: Final = 15
-    MAX_QUOTE_SIZE: Final = 3
-
-    def __init__(self, underlying_initial_state: list[Underlying], option_initial_state: list[BinaryOption], cash_balance: float) -> None:
+    def __init__(self, underlying_initial_state: list[Underlying], option_initial_state: list[BinaryOption], cash_balance: float, policy: QuotingPolicy = OPTIMIZED_POLICY) -> None:
         self.underlying_state = underlying_initial_state
         self.active_option_state = option_initial_state
         self.cash_balance = cash_balance
         self.position: defaultdict[int, int] = defaultdict(int)
+        self.policy = policy
 
     @property
     def name(self) -> str:
@@ -213,36 +235,53 @@ class MarketMaker:
     def price_option(self, option: BinaryOption) -> float:
         return self.price_option_from_parameters(self.estimated_params, option) if hasattr(self, "estimated_params") else 0.5
 
+    def _short_liability(self) -> int:
+        """Worst-case settlement liability from all currently short binaries."""
+        return sum(max(-quantity, 0) for quantity in self.position.values())
+
+    def _risk_cap(self, option: BinaryOption, selling: bool) -> int:
+        inventory = self.position[option.option_id]
+        position_room = self.policy.max_position + inventory if selling else self.policy.max_position - inventory
+        if position_room <= 0:
+            return 0
+        if selling:
+            capital_room = int(max(0.0, self.cash_balance * self.policy.capital_utilization - self._short_liability()))
+        else:
+            capital_room = int(max(0.0, self.cash_balance * self.policy.capital_utilization))
+        return max(0, min(position_room, capital_room))
+
     def quote(self, option: BinaryOption, counterparty_id: int) -> Quote:
         fair_value = self.price_option(option)
         inventory = self.position[option.option_id]
-        skew = inventory * 0.015
-        half_spread = 0.03 + abs(inventory) * 0.002
+        # Quotes tighten for high-confidence contracts and widen near p=0.5,
+        # where binary outcomes have the largest jump risk.
+        uncertainty = math.sqrt(max(0.0, fair_value * (1 - fair_value)))
+        skew = inventory * self.policy.inventory_skew
+        half_spread = self.policy.minimum_half_spread + self.policy.uncertainty_spread * uncertainty + abs(inventory) * self.policy.inventory_widening
         bid = round(max(0, min(0.98, fair_value - half_spread - skew)), 2)
         ask = round(max(0.01, min(1, fair_value + half_spread - skew)), 2)
-        if inventory >= self.MAX_POSITION:
+        if inventory >= self.policy.max_position:
             bid = 0.0
-        elif inventory <= -self.MAX_POSITION:
+        elif inventory <= -self.policy.max_position:
             ask = 1.0
         if bid >= ask:
             bid, ask = max(0, round(ask - 0.01, 2)), ask
             if bid >= ask:
                 ask = min(1, round(bid + 0.01, 2))
-        allocation = max(self.cash_balance, 0) / max(1, len(self.active_option_state))
-        buy_capacity = int(allocation / bid) if bid else self.MAX_QUOTE_SIZE
-        sell_capacity = int(allocation / (1 - ask)) if ask < 1 else self.MAX_QUOTE_SIZE
-        if buy_capacity < 1:
+        buy_capacity = self._risk_cap(option, selling=False)
+        sell_capacity = self._risk_cap(option, selling=True)
+        if buy_capacity == 0:
             bid, buy_capacity = 0.0, 1
-        if sell_capacity < 1:
+        if sell_capacity == 0:
             ask, sell_capacity = 1.0, 1
-        return Quote(bid, min(self.MAX_QUOTE_SIZE, buy_capacity), ask, min(self.MAX_QUOTE_SIZE, sell_capacity))
+        return Quote(bid, min(self.policy.max_quote_size, buy_capacity), ask, min(self.policy.max_quote_size, sell_capacity))
 
     def respond_to_fok(self, option: BinaryOption, order: FokOrder) -> bool:
         fair_value, inventory = self.price_option(option), self.position[option.option_id]
         selling = order.order_type == OrderType.BUY
         reduces_inventory = (selling and inventory > 0) or (not selling and inventory < 0)
-        edge = 0.01 if reduces_inventory else 0.03
-        if abs(inventory + (-order.quantity if selling else order.quantity)) > self.MAX_POSITION:
+        edge = self.policy.reduce_risk_edge if reduces_inventory else self.policy.add_risk_edge
+        if order.quantity > self._risk_cap(option, selling):
             return False
         if selling:
             return order.price >= fair_value + edge and self.cash_balance >= (1 - order.price) * order.quantity
